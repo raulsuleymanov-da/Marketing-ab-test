@@ -1,0 +1,190 @@
+---
+title: "Marketing A/B Test: Ad vs PSA"
+author: "Raul Suleymanov"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+A company ran a marketing A/B test: most users saw an advertisement
+(group `ad`), while a small control group saw a neutral public service
+announcement (group `psa`). The goal of this analysis is to find out
+whether the ad increases the conversion rate, i.e. the share of users
+who made a purchase.
+
+- **Dataset:** 588,101 users (Kaggle, "Marketing A/B Testing")
+- **Primary metric:** `converted` (yes/no)
+- **Hypothesis:** users who saw the ad convert at a higher rate than the control group
+
+## 1. Data loading
+
+```{r load, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(janitor)
+
+df <- read_csv("marketing_AB.csv") |>
+  clean_names() |>
+  select(-1) |>   
+  mutate(test_group = factor(test_group, levels = c("psa", "ad")))
+
+glimpse(df)
+```
+
+## 2. Data quality check
+
+First, we check for missing values and duplicate users, and look at the size of each group.
+
+```{r quality}
+colSums(is.na(df))
+sum(duplicated(df$user_id))
+
+df |>
+  count(test_group) |>
+  mutate(share = n / sum(n))
+```
+
+There are no missing values and no duplicate users. The groups are very unbalanced
+(about 96% `ad` vs 4% `psa`). This looks like a deliberate design of the test
+(a small control group), so a classic 50/50 split check does not apply here.
+What matters more is whether the two groups are similar to each other.
+
+## 3. Are the groups comparable?
+
+### Number of ads shown
+
+```{r ads-distribution}
+summary(df$total_ads)
+quantile(df$total_ads, c(0.5, 0.9, 0.99, 0.999))
+
+ggplot(df, aes(total_ads)) +
+  geom_histogram(bins = 60) +
+  scale_x_log10() +
+  facet_wrap(~ test_group, scales = "free_y") +
+  labs(title = "Distribution of ads shown by group",
+       x = "Ads shown (log scale)",
+       y = "Users")
+```
+
+The distribution is strongly right-skewed: most users saw a few dozen ads, while a few
+saw thousands. These outliers are real users and do not affect the main metric
+(`converted`), so they are kept.
+
+```{r ads-compare}
+df |>
+  group_by(test_group) |>
+  summarise(mean = mean(total_ads),
+            median = median(total_ads),
+            p90 = quantile(total_ads, 0.9))
+
+wilcox.test(total_ads ~ test_group, data = df)
+```
+
+The mean number of ads is almost identical in both groups (about 25), and the medians are
+13 vs 12. The Wilcoxon test is statistically significant only because the sample is huge;
+the practical difference is negligible.
+
+### Day of the week and hour of the day
+
+```{r day-hour}
+tab_day  <- table(df$test_group, df$most_ads_day)
+tab_hour <- table(df$test_group, df$most_ads_hour)
+
+round(prop.table(tab_day, 1), 3)
+
+chisq.test(tab_day)
+chisq.test(tab_hour)
+
+# Effect size (Cramer's V)
+cramers_v <- function(tab) {
+  chi <- suppressWarnings(chisq.test(tab))$statistic
+  unname(sqrt(chi / (sum(tab) * (min(dim(tab)) - 1))))
+}
+
+cramers_v(tab_day)
+cramers_v(tab_hour)
+```
+
+```{r hour-plot}
+df |>
+  count(test_group, most_ads_hour) |>
+  group_by(test_group) |>
+  mutate(share = n / sum(n)) |>
+  ggplot(aes(most_ads_hour, share, color = test_group)) +
+  geom_line() +
+  labs(title = "Share of users by hour of peak ad exposure",
+       x = "Hour of day",
+       y = "Share of users",
+       color = "Group")
+```
+
+Both chi-squared tests give very small p-values, but this is expected with more than half
+a million users. The effect size (Cramer's V) is about 0.02 for both day and hour, which is
+practically zero. The groups are comparable, so a difference in conversion can reasonably be
+linked to the ad.
+
+## 4. Conversion: ad vs control
+
+```{r conversion}
+conv <- df |>
+  group_by(test_group) |>
+  summarise(users = n(),
+            conversions = sum(converted),
+            rate = conversions / users)
+conv
+
+ggplot(conv, aes(test_group, rate, fill = test_group)) +
+  geom_col(show.legend = FALSE) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Conversion rate by group",
+       x = "Group",
+       y = "Conversion rate")
+```
+
+### Statistical test
+
+We compare two proportions with a two-sample test of proportions.
+
+```{r prop-test}
+ad  <- filter(conv, test_group == "ad")
+psa <- filter(conv, test_group == "psa")
+
+res <- prop.test(x = c(ad$conversions, psa$conversions),
+                 n = c(ad$users, psa$users))
+res
+```
+
+```{r effect}
+diff_abs <- ad$rate - psa$rate   # absolute difference
+lift_rel <- ad$rate / psa$rate - 1   # relative lift
+
+diff_abs
+lift_rel
+res$conf.int   # 95% confidence interval for the difference
+```
+
+## Conclusion
+
+- The conversion rate was **2.55%** in the ad group and **1.79%** in the control group.
+- The absolute difference is about **0.77 percentage points** (95% CI: 0.59 to 0.95 p.p.).
+  The interval does not include zero, so the effect is statistically significant.
+- The relative lift is about **43%**. In practical terms, this is roughly 8 extra
+  conversions for every 1,000 users who saw the ad.
+- The ad is effective, so continuing to invest in it makes sense.
+
+**Limitations**
+
+- The control group is small (about 4% of users), so its conversion estimate is less precise.
+  This is reflected in the width of the confidence interval.
+- We do not know how users were assigned to groups, so we assume the assignment was random.
+- Differences by day, hour or number of ads shown describe associations, not causes,
+  because users did not choose these randomly.
+- The analysis does not include the cost of the ads, so we cannot say whether the extra
+  conversions are profitable.
